@@ -1,0 +1,220 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Tag and publish after artifact verification
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  native:
+    name: Native archive ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            runner: macos-15
+          - platform: darwin-amd64
+            runner: macos-13
+          - platform: linux-amd64
+            runner: ubuntu-22.04
+          - platform: linux-arm64
+            runner: ubuntu-22.04-arm
+          - platform: windows-amd64
+            runner: windows-2025
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ matrix.platform != 'windows-amd64' }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ matrix.platform == 'windows-amd64' }}
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - uses: msys2/setup-msys2@v2
+        if: ${{ matrix.platform == 'windows-amd64' }}
+        with:
+          msystem: MINGW64
+          update: true
+          path-type: inherit
+          install: >-
+            make
+            mingw-w64-x86_64-gcc
+
+      - name: Check generated version files
+        if: ${{ matrix.platform != 'windows-amd64' }}
+        run: make generate.check
+
+      - name: Check generated version files
+        if: ${{ matrix.platform == 'windows-amd64' }}
+        shell: msys2 {0}
+        run: make generate.check
+
+      - name: Build and test bundled archive
+        if: ${{ matrix.platform != 'windows-amd64' }}
+        run: make test
+
+      - name: Build and test bundled archive
+        if: ${{ matrix.platform == 'windows-amd64' }}
+        shell: msys2 {0}
+        env:
+          CGO_ENABLED: "1"
+          CC: gcc
+          CARGO_BUILD_TARGET: x86_64-pc-windows-gnu
+        run: make test
+
+      - name: Upload native libraries
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.platform }}
+          path: internal/native/lib/${{ matrix.platform }}/*datafusion_go*
+          if-no-files-found: error
+
+  release:
+    name: Cut release
+    needs: native
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check generated version files
+        run: make generate.check
+
+      - name: Compute release metadata
+        id: version
+        run: go run ./internal/tools/genversions -github-output "$GITHUB_OUTPUT"
+
+      - name: Check release tag
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.release_tag }}"
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "tag ${tag} already exists" >&2
+            exit 1
+          fi
+
+      - name: Download native archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: internal/native/lib
+          merge-multiple: false
+
+      - name: Place native archives
+        run: |
+          set -euo pipefail
+          for dir in internal/native/lib/native-*; do
+            platform="${dir##*/native-}"
+            mkdir -p "internal/native/lib/${platform}"
+            find "${dir}" -maxdepth 1 -type f -print | while read -r file; do
+              mv "${file}" "internal/native/lib/${platform}/$(basename "${file}")"
+            done
+            rmdir "${dir}"
+          done
+          find internal/native/lib -type f -print | sort
+
+      - name: Generate checksums
+        run: make checksums
+
+      - name: Verify checksums
+        run: make verify.checksums
+
+      - name: Verify downloaded release artifacts
+        run: make verify.release.downloaded
+
+      - name: Stage release assets
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.release_tag }}"
+          rm -rf dist
+          mkdir -p dist
+          while IFS= read -r file; do
+            platform="$(basename "$(dirname "${file}")")"
+            base="$(basename "${file}")"
+            cp "${file}" "dist/datafusion-go-${tag}-${platform}-${base}"
+          done < <(find internal/native/lib -mindepth 2 -maxdepth 2 -type f \( -name 'libdatafusion_go.a' -o -name 'libdatafusion_go.so' -o -name 'libdatafusion_go.dylib' -o -name 'datafusion_go.dll' \) -print | sort)
+          cd dist
+          shasum -a 256 datafusion-go-* > SHA256SUMS
+          shasum -a 256 -c SHA256SUMS
+          cd ..
+          cp dist/SHA256SUMS internal/native/lib/SHA256SUMS
+
+      - name: Prepare release notes
+        id: notes
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.release_tag }}"
+          notes_file="$(mktemp)"
+          awk -v tag="$tag" '
+            $0 == "## " tag || index($0, "## " tag " - ") == 1 { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+            END { if (!found) exit 1 }
+          ' CHANGELOG.md > "$notes_file"
+          if ! grep -q '[^[:space:]]' "$notes_file"; then
+            echo "CHANGELOG.md entry for ${tag} is empty" >&2
+            exit 1
+          fi
+          echo "path=${notes_file}" >> "$GITHUB_OUTPUT"
+
+      - name: Commit release checksum manifest
+        if: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f internal/native/lib/SHA256SUMS
+          if git diff --cached --quiet; then
+            echo "release checksum manifest is unchanged"
+          else
+            git commit -m "chore: prepare ${{ steps.version.outputs.release_tag }} native checksums"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+      - name: Tag release
+        if: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.version.outputs.release_tag }}" -m "${{ steps.version.outputs.release_tag }}"
+          git push origin "${{ steps.version.outputs.release_tag }}"
+
+      - name: Create GitHub release
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          assets=(dist/SHA256SUMS)
+          while IFS= read -r file; do
+            assets+=("$file")
+          done < <(find dist -type f -name 'datafusion-go-*' -print | sort)
+          gh release create "${{ steps.version.outputs.release_tag }}" \
+            --title "${{ steps.version.outputs.release_tag }}" \
+            --notes-file "${{ steps.notes.outputs.path }}" \
+            "${assets[@]}"
