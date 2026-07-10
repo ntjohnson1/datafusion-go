@@ -283,6 +283,21 @@ impl fmt::Display for CancelledError {
 
 impl std::error::Error for CancelledError {}
 
+// Raised when polling the DataFusion stream panics — most plausibly inside a
+// foreign FFI table provider's execution. The panic is contained before it can
+// unwind across the Arrow C stream callback into Go, and reported as a terminal
+// stream error instead.
+#[derive(Debug)]
+struct ReaderPanicError;
+
+impl fmt::Display for ReaderPanicError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("panic while reading query results across datafusion-go native boundary")
+    }
+}
+
+impl std::error::Error for ReaderPanicError {}
+
 struct StreamingReader {
     // Hold Inner so the runtime and SessionContext stay alive for every C stream
     // callback. The Go side may close statements/connections while rows remain.
@@ -309,15 +324,32 @@ impl Iterator for StreamingReader {
 
         let cancel = self.cancel.clone();
         let stream = &mut self.stream;
+        let runtime = &self.inner.runtime;
         // Arrow's C stream API is pull-based and synchronous. DataFusion's
         // stream is async, so each pull blocks this crate's runtime until either
         // the next batch arrives or cancellation wins the select.
-        let next = self.inner.runtime.block_on(async {
-            tokio::select! {
-                _ = cancel.cancelled() => Some(Err(cancelled_datafusion_error())),
-                item = stream.next() => item,
+        //
+        // Polling runs the table provider's execution, which for a foreign FFI
+        // provider is arbitrary producer code. A panic there must not unwind
+        // across the Arrow C stream callback into Go (undefined behavior), so it
+        // is contained here and reported as a terminal error, mirroring the
+        // `run_ffi` guard on the synchronous entry points.
+        let polled = catch_unwind(AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                tokio::select! {
+                    _ = cancel.cancelled() => Some(Err(cancelled_datafusion_error())),
+                    item = stream.next() => item,
+                }
+            })
+        }));
+
+        let next = match polled {
+            Ok(next) => next,
+            Err(_) => {
+                self.done = true;
+                return Some(Err(ArrowError::ExternalError(Box::new(ReaderPanicError))));
             }
-        });
+        };
 
         match next {
             Some(Ok(batch)) => Some(Ok(batch)),
@@ -1980,6 +2012,52 @@ mod tests {
         assert_eq!(rc, DFG_ERR);
         assert!(!err.is_null());
         unsafe { dfgo_error_free(err) };
+    }
+
+    /// A panic while polling the result stream — the path a foreign FFI table
+    /// provider's execution runs on — is contained and surfaced as a terminal
+    /// error, rather than unwinding across the Arrow C stream callback into Go.
+    #[test]
+    fn panic_while_polling_stream_is_contained() {
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::stream;
+
+        fn panicking_batch() -> Result<RecordBatch, DataFusionError> {
+            panic!("boom from a foreign table provider scan");
+        }
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "a",
+            DataType::Int64,
+            false,
+        )]));
+        // The panic fires when the stream is first polled, inside next().
+        let panicking = stream::once(async { panicking_batch() });
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            panicking,
+        ));
+
+        let mut reader = StreamingReader {
+            inner: Arc::new(Inner {
+                runtime: Arc::new(Runtime::new().expect("runtime")),
+                ctx: SessionContext::new(),
+            }),
+            schema,
+            stream,
+            cancel: Arc::new(CancelToken::new()),
+            done: false,
+        };
+
+        match reader.next() {
+            Some(Err(ArrowError::ExternalError(err))) => {
+                assert!(err.downcast_ref::<ReaderPanicError>().is_some());
+            }
+            other => panic!("expected a contained panic error, got {other:?}"),
+        }
+        // The reader is terminal after a contained panic and never re-polls.
+        assert!(reader.next().is_none());
     }
 
     #[test]
