@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql/driver"
 	"sync"
-	"unsafe"
 
 	"github.com/datafusion-contrib/datafusion-go/internal/native"
 )
@@ -20,19 +19,6 @@ type Conn struct {
 
 func newConn(conn *native.Connection, connector *Connector) *Conn {
 	return &Conn{conn: conn, connector: connector}
-}
-
-// RegisterFFITableProvider registers a foreign datafusion-ffi FFI_TableProvider
-// (produced by another library) as a queryable table under name. provider must
-// point to a valid FFI_TableProvider; it is cloned on registration, so the
-// caller retains ownership and should free the original.
-func (conn *Conn) RegisterFFITableProvider(name string, provider unsafe.Pointer) error {
-	conn.mu.Lock()
-	defer conn.mu.Unlock()
-	if conn.closed || conn.conn == nil {
-		return driver.ErrBadConn
-	}
-	return conn.conn.RegisterFFITableProvider(name, provider)
 }
 
 // Prepare validates and prepares query using a background context.

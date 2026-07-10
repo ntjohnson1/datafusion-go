@@ -25,6 +25,8 @@ typedef int (*dfgo_connection_open_shared_fn)(dfgo_database *, dfgo_connection *
 typedef void (*dfgo_connection_close_fn)(dfgo_connection *);
 typedef int (*dfgo_connection_register_arrow_ipc_fn)(dfgo_connection *, const char *, const uint8_t *, int64_t, dfgo_error **);
 typedef int (*dfgo_connection_register_arrow_stream_fn)(dfgo_connection *, const char *, struct ArrowArrayStream *, dfgo_error **);
+typedef int (*dfgo_connection_register_ffi_table_provider_fn)(dfgo_connection *, const char *, const void *, const char *, dfgo_error **);
+typedef int (*dfgo_connection_deregister_table_fn)(dfgo_connection *, const char *, dfgo_error **);
 typedef int (*dfgo_prepare_fn)(dfgo_connection *, const char *, dfgo_statement **, dfgo_error **);
 typedef void (*dfgo_statement_close_fn)(dfgo_statement *);
 typedef int64_t (*dfgo_statement_num_params_fn)(dfgo_statement *);
@@ -49,6 +51,8 @@ static dfgo_connection_open_shared_fn p_dfgo_connection_open_shared;
 static dfgo_connection_close_fn p_dfgo_connection_close;
 static dfgo_connection_register_arrow_ipc_fn p_dfgo_connection_register_arrow_ipc;
 static dfgo_connection_register_arrow_stream_fn p_dfgo_connection_register_arrow_stream;
+static dfgo_connection_register_ffi_table_provider_fn p_dfgo_connection_register_ffi_table_provider;
+static dfgo_connection_deregister_table_fn p_dfgo_connection_deregister_table;
 static dfgo_prepare_fn p_dfgo_prepare;
 static dfgo_statement_close_fn p_dfgo_statement_close;
 static dfgo_statement_num_params_fn p_dfgo_statement_num_params;
@@ -139,6 +143,8 @@ static int dfgo_native_load_library(const char *path) {
 	DFGO_LOAD_SYMBOL(dfgo_connection_close);
 	DFGO_LOAD_SYMBOL(dfgo_connection_register_arrow_ipc);
 	DFGO_LOAD_SYMBOL(dfgo_connection_register_arrow_stream);
+	DFGO_LOAD_SYMBOL(dfgo_connection_register_ffi_table_provider);
+	DFGO_LOAD_SYMBOL(dfgo_connection_deregister_table);
 	DFGO_LOAD_SYMBOL(dfgo_prepare);
 	DFGO_LOAD_SYMBOL(dfgo_statement_close);
 	DFGO_LOAD_SYMBOL(dfgo_statement_num_params);
@@ -190,6 +196,14 @@ static int dfgo_connection_register_arrow_ipc(dfgo_connection *conn, const char 
 
 static int dfgo_connection_register_arrow_stream(dfgo_connection *conn, const char *name, struct ArrowArrayStream *stream, dfgo_error **err) {
 	return p_dfgo_connection_register_arrow_stream(conn, name, stream, err);
+}
+
+static int dfgo_connection_register_ffi_table_provider(dfgo_connection *conn, const char *name, const void *provider, const char *provider_datafusion_version, dfgo_error **err) {
+	return p_dfgo_connection_register_ffi_table_provider(conn, name, provider, provider_datafusion_version, err);
+}
+
+static int dfgo_connection_deregister_table(dfgo_connection *conn, const char *name, dfgo_error **err) {
+	return p_dfgo_connection_deregister_table(conn, name, err);
 }
 
 static int dfgo_prepare(dfgo_connection *conn, const char *query, dfgo_statement **out, dfgo_error **err) {

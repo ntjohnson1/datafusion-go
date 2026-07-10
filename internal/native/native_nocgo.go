@@ -38,7 +38,11 @@ func (conn *Connection) RegisterArrowReaderZeroCopy(string, array.RecordReader) 
 	return errCgoDisabled
 }
 
-func (conn *Connection) RegisterFFITableProvider(string, unsafe.Pointer) error {
+func (conn *Connection) RegisterFFITableProvider(string, unsafe.Pointer, string) error {
+	return errCgoDisabled
+}
+
+func (conn *Connection) DeregisterTable(string) error {
 	return errCgoDisabled
 }
 

@@ -1169,6 +1169,15 @@ pub extern "C" fn dfgo_datafusion_version() -> *const c_char {
     DATAFUSION_VERSION.as_ptr().cast()
 }
 
+/// The datafusion version this crate links, as a `&str`, for the FFI provider
+/// version handshake. Derived from the generated `DATAFUSION_VERSION` bytes.
+fn datafusion_version_str() -> &'static str {
+    CStr::from_bytes_with_nul(DATAFUSION_VERSION)
+        .expect("generated DATAFUSION_VERSION is NUL-terminated")
+        .to_str()
+        .expect("generated DATAFUSION_VERSION is valid UTF-8")
+}
+
 /// # Safety
 ///
 /// `dsn`, when non-null, must point to a valid NUL-terminated C string for the
@@ -1386,17 +1395,36 @@ pub unsafe extern "C" fn dfgo_connection_register_arrow_stream(
 /// provider is imported via datafusion-ffi's `From<&FFI_TableProvider>`, which
 /// clones it — the caller retains ownership of `provider` and must free it.
 ///
+/// The clone only bumps the foreign provider's refcount; the registered table
+/// invokes the provider's function pointers on every scan. The producing
+/// library therefore must stay loaded and un-freed for as long as the table
+/// remains registered on `conn` — its `scan`/`clone`/`release` function
+/// pointers dangle if it is unloaded, which is undefined behavior. The session
+/// backing the provider's (weakly held) task context should also outlive the
+/// registration; if it does not, queries against the table fail with a clean
+/// "TaskContextProvider went out of scope" error rather than crashing.
+///
+/// `provider_datafusion_version` is the datafusion version the producing
+/// library reports building against. It is compared against this crate's
+/// version *before* `provider` is dereferenced: `FFI_TableProvider` is a plain
+/// `repr(C)` vtable with no stable prefix, so its layout (and its own `version`
+/// function pointer) can only be trusted once the versions are known to match.
+/// A mismatch is rejected as an error instead of risking undefined behavior.
+/// This is a cooperative check and cannot detect a mislabeled provider.
+///
 /// # Safety
 ///
-/// `conn` must be a live connection handle. `name` must be a valid
-/// NUL-terminated C string. `provider` must be a non-null pointer to a valid
-/// `FFI_TableProvider`. `err`, when non-null, must point to writable
-/// error-handle storage.
+/// `conn` must be a live connection handle. `name` and
+/// `provider_datafusion_version` must be valid NUL-terminated C strings.
+/// `provider` must be a non-null pointer to a valid `FFI_TableProvider` built
+/// against the reported datafusion version. `err`, when non-null, must point to
+/// writable error-handle storage.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dfgo_connection_register_ffi_table_provider(
     conn: *mut dfgo_connection,
     name: *const c_char,
     provider: *const c_void,
+    provider_datafusion_version: *const c_char,
     err: *mut *mut dfgo_error,
 ) -> i32 {
     run_ffi(err, || {
@@ -1407,14 +1435,60 @@ pub unsafe extern "C" fn dfgo_connection_register_ffi_table_provider(
             return Err(FfiError::invalid_argument("provider handle is null"));
         }
         let name = cstr_to_string(name, "table name")?;
+        let provider_version =
+            cstr_to_string(provider_datafusion_version, "provider datafusion version")?;
+
+        // Out-of-band version handshake, checked BEFORE the provider is
+        // dereferenced. Because `FFI_TableProvider` has no stable prefix, reading
+        // anything out of it — including its own `version` fn-pointer — is only
+        // sound once we know the layouts match. A mismatch becomes a clean error
+        // instead of undefined behavior.
+        let expected = datafusion_version_str();
+        if provider_version != expected {
+            return Err(FfiError::invalid_argument(format!(
+                "incompatible FFI table provider: datafusion-go links datafusion \
+                 {expected}, but the provider reports {provider_version}; both sides \
+                 must link the same datafusion version"
+            )));
+        }
+
         // SAFETY: `conn` is non-null and borrowed only for the duration of
         // registration.
         let conn = unsafe { &*conn };
-        // SAFETY: `provider` is non-null and, per the contract, points to a
-        // valid `FFI_TableProvider`. We only borrow it; `From` clones it.
+        // SAFETY: `provider` is non-null, the version handshake above confirmed a
+        // matching datafusion build, and per the contract it points to a valid
+        // `FFI_TableProvider`. We only borrow it; `From` clones it.
         let ffi_provider = unsafe { &*(provider as *const FFI_TableProvider) };
         let table: Arc<dyn TableProvider> = ffi_provider.into();
         conn.inner.ctx.register_table(&name, table)?;
+        Ok(())
+    })
+}
+
+/// Deregister a table previously registered on `conn` (for example one added by
+/// [`dfgo_connection_register_ffi_table_provider`]). Deregistering a name that
+/// is not currently registered is not an error.
+///
+/// # Safety
+///
+/// `conn` must be a live connection handle. `name` must be a valid
+/// NUL-terminated C string. `err`, when non-null, must point to writable
+/// error-handle storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dfgo_connection_deregister_table(
+    conn: *mut dfgo_connection,
+    name: *const c_char,
+    err: *mut *mut dfgo_error,
+) -> i32 {
+    run_ffi(err, || {
+        if conn.is_null() {
+            return Err(FfiError::invalid_argument("connection handle is null"));
+        }
+        let name = cstr_to_string(name, "table name")?;
+        // SAFETY: `conn` is non-null and borrowed only for the duration of the
+        // deregistration.
+        let conn = unsafe { &*conn };
+        conn.inner.ctx.deregister_table(&name)?;
         Ok(())
     })
 }
@@ -1805,12 +1879,14 @@ mod tests {
 
         // Exercise the exported C entry point exactly as Go calls it.
         let name = CString::new("t").unwrap();
+        let version = CString::new(datafusion_version_str()).unwrap();
         let mut err: *mut dfgo_error = ptr::null_mut();
         let rc = unsafe {
             dfgo_connection_register_ffi_table_provider(
                 &mut conn,
                 name.as_ptr(),
                 &ffi as *const FFI_TableProvider as *const std::ffi::c_void,
+                version.as_ptr(),
                 &mut err,
             )
         };
@@ -1832,6 +1908,44 @@ mod tests {
             .map(|b| b.num_rows())
             .sum();
         assert_eq!(rows, 2, "expected rows a=2,3");
+
+        // Deregistering removes the table, so planning against it now fails.
+        let mut derr: *mut dfgo_error = ptr::null_mut();
+        let drc =
+            unsafe { dfgo_connection_deregister_table(&mut conn, name.as_ptr(), &mut derr) };
+        assert_eq!(drc, DFG_OK, "deregister returned an error");
+        assert!(derr.is_null(), "deregister set an error");
+        let after = runtime.block_on(async { conn.inner.ctx.sql("SELECT a FROM t").await });
+        assert!(after.is_err(), "table should be gone after deregister");
+    }
+
+    /// A datafusion version mismatch is rejected before the provider pointer is
+    /// dereferenced, so a bogus pointer never gets read as a vtable.
+    #[test]
+    fn rejects_version_mismatch_before_dereference() {
+        let mut conn = dfgo_connection {
+            inner: Arc::new(Inner {
+                runtime: Arc::new(Runtime::new().expect("runtime")),
+                ctx: SessionContext::new(),
+            }),
+        };
+        let name = CString::new("t").unwrap();
+        let version = CString::new("0.0.0-not-a-real-version").unwrap();
+        // Not a real FFI_TableProvider; must never be dereferenced.
+        let bogus: [u8; 64] = [0; 64];
+        let mut err: *mut dfgo_error = ptr::null_mut();
+        let rc = unsafe {
+            dfgo_connection_register_ffi_table_provider(
+                &mut conn,
+                name.as_ptr(),
+                bogus.as_ptr() as *const std::ffi::c_void,
+                version.as_ptr(),
+                &mut err,
+            )
+        };
+        assert_eq!(rc, DFG_ERR);
+        assert!(!err.is_null());
+        unsafe { dfgo_error_free(err) };
     }
 
     /// A null provider pointer is rejected rather than dereferenced.
@@ -1844,12 +1958,14 @@ mod tests {
             }),
         };
         let name = CString::new("t").unwrap();
+        let version = CString::new(datafusion_version_str()).unwrap();
         let mut err: *mut dfgo_error = ptr::null_mut();
         let rc = unsafe {
             dfgo_connection_register_ffi_table_provider(
                 &mut conn,
                 name.as_ptr(),
                 ptr::null(),
+                version.as_ptr(),
                 &mut err,
             )
         };
