@@ -31,6 +31,10 @@ type RegisteredTable struct {
 // sqlConn can scan the table, and projection/filter predicates are pushed down
 // into the foreign provider.
 //
+// The table is registered on sqlConn's session, following the usual session
+// semantics: with WithSharedSession it is registered on the shared session and
+// is therefore visible to every connection sharing it, not just sqlConn.
+//
 // provider must point to a valid, initialized datafusion-ffi FFI_TableProvider.
 // providerDataFusionVersion is the datafusion version the library that produced
 // provider was built against; obtain it from that library (not from
@@ -83,9 +87,11 @@ func (t *RegisteredTable) Name() string {
 	return t.name
 }
 
-// Deregister removes the table from the connection's session. Calling it more
-// than once is a no-op that returns nil, and deregistering a name that is no
-// longer registered is not an error.
+// Deregister removes the table from the session it was registered on. Under
+// WithSharedSession that is the shared session, so the table is removed for
+// every connection sharing it, not just sqlConn. Calling it more than once is a
+// no-op that returns nil, and deregistering a name that is no longer registered
+// is not an error.
 //
 // Closing the underlying *sql.Conn already releases the table, so an explicit
 // Deregister is only needed to remove it sooner. Like the other connection
