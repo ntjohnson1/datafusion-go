@@ -13,7 +13,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::collections::{BTreeSet, HashMap};
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::fmt;
 use std::io::Cursor;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -28,11 +28,13 @@ use arrow::error::ArrowError;
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
+use datafusion::catalog::TableProvider;
 use datafusion::common::{DataFusionError, ParamValues, ScalarValue};
 use datafusion::datasource::MemTable;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::context::SessionConfig;
 use datafusion::prelude::SessionContext;
+use datafusion_ffi::table_provider::FFI_TableProvider;
 use datafusion_sql::parser::{DFParser, Statement as DFStatement};
 use datafusion_sql::sqlparser::ast::Statement as SQLStatement;
 use datafusion_sql::sqlparser::dialect::GenericDialect;
@@ -1378,6 +1380,45 @@ pub unsafe extern "C" fn dfgo_connection_register_arrow_stream(
     })
 }
 
+/// Register a foreign `datafusion-ffi` `FFI_TableProvider` produced by another
+/// library. `provider` points to an `FFI_TableProvider` (passed as an opaque
+/// `const void*` so the C header need not know datafusion-ffi's layout). The
+/// provider is imported via datafusion-ffi's `From<&FFI_TableProvider>`, which
+/// clones it — the caller retains ownership of `provider` and must free it.
+///
+/// # Safety
+///
+/// `conn` must be a live connection handle. `name` must be a valid
+/// NUL-terminated C string. `provider` must be a non-null pointer to a valid
+/// `FFI_TableProvider`. `err`, when non-null, must point to writable
+/// error-handle storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dfgo_connection_register_ffi_table_provider(
+    conn: *mut dfgo_connection,
+    name: *const c_char,
+    provider: *const c_void,
+    err: *mut *mut dfgo_error,
+) -> i32 {
+    run_ffi(err, || {
+        if conn.is_null() {
+            return Err(FfiError::invalid_argument("connection handle is null"));
+        }
+        if provider.is_null() {
+            return Err(FfiError::invalid_argument("provider handle is null"));
+        }
+        let name = cstr_to_string(name, "table name")?;
+        // SAFETY: `conn` is non-null and borrowed only for the duration of
+        // registration.
+        let conn = unsafe { &*conn };
+        // SAFETY: `provider` is non-null and, per the contract, points to a
+        // valid `FFI_TableProvider`. We only borrow it; `From` clones it.
+        let ffi_provider = unsafe { &*(provider as *const FFI_TableProvider) };
+        let table: Arc<dyn TableProvider> = ffi_provider.into();
+        conn.inner.ctx.register_table(&name, table)?;
+        Ok(())
+    })
+}
+
 /// # Safety
 ///
 /// `conn` must be a live connection handle. `query` must point to a valid
@@ -1722,6 +1763,100 @@ pub unsafe extern "C" fn dfgo_error_free(err: *mut dfgo_error) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Registering a foreign `FFI_TableProvider` makes it queryable by name.
+    #[test]
+    fn registers_and_queries_ffi_table_provider() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use datafusion::execution::TaskContextProvider;
+        use datafusion_ffi::execution::FFI_TaskContextProvider;
+        use datafusion_ffi::table_provider::FFI_TableProvider;
+
+        // A one-column, three-row MemTable exported as an FFI_TableProvider.
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "a",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
+        )
+        .expect("record batch");
+        let mem: Arc<dyn TableProvider> =
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("memtable"));
+
+        // FFI_TaskContextProvider holds a Weak, so this SessionContext must
+        // outlive the exported provider for the duration of the test.
+        let tcp_ctx = Arc::new(SessionContext::new());
+        let tcp = Arc::clone(&tcp_ctx) as Arc<dyn TaskContextProvider>;
+        let ffi =
+            FFI_TableProvider::new(mem, true, None, FFI_TaskContextProvider::from(&tcp), None);
+
+        // A minimal connection handle to register into.
+        let runtime = Arc::new(Runtime::new().expect("runtime"));
+        let mut conn = dfgo_connection {
+            inner: Arc::new(Inner {
+                runtime: Arc::clone(&runtime),
+                ctx: SessionContext::new(),
+            }),
+        };
+
+        // Exercise the exported C entry point exactly as Go calls it.
+        let name = CString::new("t").unwrap();
+        let mut err: *mut dfgo_error = ptr::null_mut();
+        let rc = unsafe {
+            dfgo_connection_register_ffi_table_provider(
+                &mut conn,
+                name.as_ptr(),
+                &ffi as *const FFI_TableProvider as *const std::ffi::c_void,
+                &mut err,
+            )
+        };
+        assert_eq!(rc, DFG_OK, "register returned an error");
+        assert!(err.is_null(), "register set an error");
+
+        // The registered provider is queryable, and a predicate filters rows.
+        let rows: usize = runtime
+            .block_on(async {
+                conn.inner
+                    .ctx
+                    .sql("SELECT a FROM t WHERE a > 1 ORDER BY a")
+                    .await?
+                    .collect()
+                    .await
+            })
+            .expect("query")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 2, "expected rows a=2,3");
+    }
+
+    /// A null provider pointer is rejected rather than dereferenced.
+    #[test]
+    fn rejects_null_ffi_table_provider() {
+        let mut conn = dfgo_connection {
+            inner: Arc::new(Inner {
+                runtime: Arc::new(Runtime::new().expect("runtime")),
+                ctx: SessionContext::new(),
+            }),
+        };
+        let name = CString::new("t").unwrap();
+        let mut err: *mut dfgo_error = ptr::null_mut();
+        let rc = unsafe {
+            dfgo_connection_register_ffi_table_provider(
+                &mut conn,
+                name.as_ptr(),
+                ptr::null(),
+                &mut err,
+            )
+        };
+        assert_eq!(rc, DFG_ERR);
+        assert!(!err.is_null());
+        unsafe { dfgo_error_free(err) };
+    }
 
     #[test]
     fn rewrites_question_marks_with_unicode_comments_and_multiline_sql() {

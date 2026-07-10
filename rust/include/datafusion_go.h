@@ -74,6 +74,9 @@ typedef struct dfgo_parameter {
  *   remain live for the duration of the call.
  * - dfgo_connection_register_arrow_stream consumes a non-null ArrowArrayStream
  *   even when later validation or registration fails.
+ * - dfgo_connection_register_ffi_table_provider borrows the FFI_TableProvider
+ *   and clones it into the session; the caller retains ownership of the
+ *   pointer and must free it through its producing library.
  * - dfgo_statement_execute_with_params borrows params and all nested pointers
  *   only for the duration of the call. Parameters are per-call state, so
  *   concurrent executions with separate params arrays cannot interleave
@@ -92,6 +95,7 @@ int dfgo_connection_open_shared(dfgo_database *db, dfgo_connection **out, dfgo_e
 void dfgo_connection_close(dfgo_connection *conn);
 int dfgo_connection_register_arrow_ipc(dfgo_connection *conn, const char *name, const uint8_t *data, int64_t len, dfgo_error **err);
 int dfgo_connection_register_arrow_stream(dfgo_connection *conn, const char *name, struct ArrowArrayStream *stream, dfgo_error **err);
+int dfgo_connection_register_ffi_table_provider(dfgo_connection *conn, const char *name, const void *provider, dfgo_error **err);
 
 int dfgo_prepare(dfgo_connection *conn, const char *query, dfgo_statement **out, dfgo_error **err);
 void dfgo_statement_close(dfgo_statement *stmt);

@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
+	"unsafe"
 
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/arrio"
@@ -34,6 +35,10 @@ func (conn *Connection) RegisterArrowIPC(string, []byte) error {
 }
 
 func (conn *Connection) RegisterArrowReaderZeroCopy(string, array.RecordReader) error {
+	return errCgoDisabled
+}
+
+func (conn *Connection) RegisterFFITableProvider(string, unsafe.Pointer) error {
 	return errCgoDisabled
 }
 

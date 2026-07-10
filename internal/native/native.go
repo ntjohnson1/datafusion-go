@@ -268,6 +268,27 @@ func (conn *Connection) RegisterArrowIPC(name string, data []byte) error {
 	return nil
 }
 
+// RegisterFFITableProvider registers a foreign datafusion-ffi FFI_TableProvider
+// (produced by another library) under name. provider must point to a valid
+// FFI_TableProvider; the callee clones it, so the caller retains ownership.
+func (conn *Connection) RegisterFFITableProvider(name string, provider unsafe.Pointer) error {
+	if conn == nil || conn.ptr == nil {
+		return errors.New("datafusion-go connection is closed")
+	}
+	if provider == nil {
+		return errors.New("datafusion-go FFI table provider is nil")
+	}
+
+	cname := C.CString(name)
+	defer C.free(unsafe.Pointer(cname))
+
+	var cerr *C.dfgo_error
+	if C.dfgo_connection_register_ffi_table_provider(conn.ptr, cname, provider, &cerr) != stateOK {
+		return takeError(cerr)
+	}
+	return nil
+}
+
 func (conn *Connection) RegisterArrowReaderZeroCopy(name string, reader array.RecordReader) error {
 	if conn == nil || conn.ptr == nil {
 		return errors.New("datafusion-go connection is closed")
