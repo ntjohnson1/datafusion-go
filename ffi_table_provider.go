@@ -83,9 +83,14 @@ func (t *RegisteredTable) Name() string {
 	return t.name
 }
 
-// Deregister removes the table from the connection's session. It is idempotent:
-// calling it more than once, or after the connection is closed, is a no-op that
-// returns nil. Deregister on a name that is no longer registered is not an error.
+// Deregister removes the table from the connection's session. Calling it more
+// than once is a no-op that returns nil, and deregistering a name that is no
+// longer registered is not an error.
+//
+// Closing the underlying *sql.Conn already releases the table, so an explicit
+// Deregister is only needed to remove it sooner. Like the other connection
+// operations in this package, Deregister on a closed connection propagates the
+// error database/sql reports (sql.ErrConnDone) rather than masking it.
 func (t *RegisteredTable) Deregister(ctx context.Context) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()

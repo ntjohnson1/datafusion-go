@@ -1435,6 +1435,9 @@ pub unsafe extern "C" fn dfgo_connection_register_ffi_table_provider(
             return Err(FfiError::invalid_argument("provider handle is null"));
         }
         let name = cstr_to_string(name, "table name")?;
+        if name.trim().is_empty() {
+            return Err(FfiError::invalid_argument("table name is empty"));
+        }
         let provider_version =
             cstr_to_string(provider_datafusion_version, "provider datafusion version")?;
 
@@ -1443,6 +1446,12 @@ pub unsafe extern "C" fn dfgo_connection_register_ffi_table_provider(
         // anything out of it — including its own `version` fn-pointer — is only
         // sound once we know the layouts match. A mismatch becomes a clean error
         // instead of undefined behavior.
+        //
+        // This requires an exact datafusion version match, which is deliberately
+        // stricter than datafusion-ffi's own contract (it promises ABI stability
+        // at the major version only; see `datafusion_ffi::version`). datafusion
+        // is pre-1.0 and has broken layouts across minor/patch releases, so we
+        // refuse anything but an exact match rather than trust a looser bound.
         let expected = datafusion_version_str();
         if provider_version != expected {
             return Err(FfiError::invalid_argument(format!(
@@ -1911,8 +1920,7 @@ mod tests {
 
         // Deregistering removes the table, so planning against it now fails.
         let mut derr: *mut dfgo_error = ptr::null_mut();
-        let drc =
-            unsafe { dfgo_connection_deregister_table(&mut conn, name.as_ptr(), &mut derr) };
+        let drc = unsafe { dfgo_connection_deregister_table(&mut conn, name.as_ptr(), &mut derr) };
         assert_eq!(drc, DFG_OK, "deregister returned an error");
         assert!(derr.is_null(), "deregister set an error");
         let after = runtime.block_on(async { conn.inner.ctx.sql("SELECT a FROM t").await });
