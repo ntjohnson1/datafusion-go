@@ -126,6 +126,7 @@ From a source checkout, run `make bundle` once, then `go run ./examples/simple`.
 - **Standard `database/sql` driver** — registered as `datafusion`, with connection pooling, prepared statements, SQL parameters, and context cancellation.
 - **Files as tables** — `CREATE EXTERNAL TABLE` over CSV and Parquet files, `COPY ... TO` to write results back out.
 - **Arrow-native APIs** — stream results as `arrow.RecordBatch` values and register Go Arrow readers as DataFusion tables, with a zero-copy option.
+- **Foreign table providers** — register a `datafusion-ffi` `FFI_TableProvider` produced by another library and query it with projection/filter pushdown reaching the provider.
 - **Typed SQL parameters** — `?`, `$1`, and `$name` styles, plus typed wrappers for dates, times, timestamps, durations, decimals, and typed nulls.
 - **Context cancellation end to end** — Go contexts bridge to native cancellation during planning, stream creation, and record-batch reads.
 - **Structured errors** — machine-readable native error kinds, matchable with `errors.Is`.
@@ -379,6 +380,29 @@ if err := datafusion.RegisterArrowReader(ctx, conn, "events", rdr); err != nil {
 
 Do not use the zero-copy API with ordinary Go-allocated Arrow buffers unless you fully own that lifetime and cgo pointer-safety tradeoff.
 
+#### Register Foreign FFI Table Providers
+
+If another library produces a `datafusion-ffi` `FFI_TableProvider` — a language binding, or a client that talks to a remote catalog and streams Arrow — register it directly so SQL can plan against it, with projection and filter predicates pushed down into the provider:
+
+```go
+// providerPtr is an *FFI_TableProvider handed to you by the producing library,
+// and providerVersion is the datafusion version that library was built against.
+table, err := datafusion.RegisterFFITableProvider(ctx, conn, "t", providerPtr, providerVersion)
+if err != nil {
+	return err
+}
+defer table.Deregister(ctx)
+
+rows, err := db.QueryContext(ctx, `SELECT ... FROM t WHERE ...`)
+```
+
+A few contract points, all enforced or documented on `RegisterFFITableProvider`:
+
+- **Version handshake.** `providerVersion` must equal this package's `DataFusionVersion`; obtain it from the producing library, not from `DataFusionVersion`. The check runs before the provider pointer is dereferenced, so a mismatch is a clean error rather than a crash. The match is required to be exact — deliberately stricter than datafusion-ffi's major-version ABI contract, because datafusion is pre-1.0 and has broken layouts across minor releases.
+- **Ownership.** The provider pointer must be memory owned by the producing foreign library (C/Rust), not Go heap memory, since native code retains callback pointers cloned out of it past the call. Registration clones the provider (bumping its refcount), so you retain ownership of the original pointer and may free it through its producing library once the call returns.
+- **Library lifetime.** The producing library must stay loaded for as long as the table is registered — the registered table calls back into its function pointers on every scan.
+- **Deregistration is explicit.** `RegisterFFITableProvider` returns a `*RegisteredTable` handle; call `Deregister` to remove the table before the producing library tears down. The table's lifetime follows the session it was registered on: with an isolated session (`WithSharedSession(false)`) closing the `*sql.Conn` also releases it, but with a shared session (the default) it lives on the shared `SessionContext` and persists until `Deregister` or the owning `Connector` is closed. Dropping the handle never deregisters it.
+
 ### API Overview
 
 The most important exported APIs:
@@ -386,6 +410,7 @@ The most important exported APIs:
 - `NewConnector` / `NewConnectorWithInitContext`: pooled databases with setup SQL and connector options such as `WithSharedSession`.
 - `QueryArrowContext`: streams Arrow record batches from a `*sql.Conn`.
 - `RegisterArrowReader` / `RegisterArrowReaderZeroCopy`: register Go Arrow readers as DataFusion tables.
+- `RegisterFFITableProvider`: register a foreign `datafusion-ffi` `FFI_TableProvider` and query it with pushdown; returns a `*RegisteredTable` handle for explicit `Deregister`.
 - `ExecStatements`: executes an already-split slice of SQL statements.
 - `Error` and the `ErrNative*` sentinels: structured driver errors with operation type and native error kind.
 

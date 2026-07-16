@@ -243,6 +243,7 @@ func updateCargoToml(path string, cfg config) ([]byte, error) {
 	section := ""
 	packageVersionSet := false
 	datafusionSet := false
+	datafusionFFISet := false
 	datafusionSQLSet := false
 	for _, raw := range strings.SplitAfter(string(data), "\n") {
 		line := strings.TrimSpace(raw)
@@ -257,6 +258,9 @@ func updateCargoToml(path string, cfg config) ([]byte, error) {
 		case section == "dependencies" && strings.HasPrefix(line, "datafusion = "):
 			fmt.Fprintf(&out, "datafusion = %q\n", "="+cfg.DataFusionVersion)
 			datafusionSet = true
+		case section == "dependencies" && strings.HasPrefix(line, "datafusion-ffi = "):
+			fmt.Fprintf(&out, "datafusion-ffi = %q\n", "="+cfg.DataFusionVersion)
+			datafusionFFISet = true
 		case section == "dependencies" && strings.HasPrefix(line, "datafusion-sql = "):
 			fmt.Fprintf(&out, "datafusion-sql = %q\n", "="+cfg.DataFusionVersion)
 			datafusionSQLSet = true
@@ -271,6 +275,9 @@ func updateCargoToml(path string, cfg config) ([]byte, error) {
 	}
 	if !datafusionSet {
 		missing = append(missing, "[dependencies].datafusion")
+	}
+	if !datafusionFFISet {
+		missing = append(missing, "[dependencies].datafusion-ffi")
 	}
 	if !datafusionSQLSet {
 		missing = append(missing, "[dependencies].datafusion-sql")

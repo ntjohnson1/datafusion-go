@@ -44,7 +44,7 @@ endif
 
 generate:
 	go run ./internal/tools/genversions
-	cargo update --manifest-path rust/Cargo.toml -p datafusion-go -p datafusion -p datafusion-sql
+	cargo update --manifest-path rust/Cargo.toml -p datafusion-go -p datafusion -p datafusion-ffi -p datafusion-sql
 
 generate.check:
 	go run ./internal/tools/genversions -check

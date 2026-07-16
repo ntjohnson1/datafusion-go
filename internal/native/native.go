@@ -268,6 +268,51 @@ func (conn *Connection) RegisterArrowIPC(name string, data []byte) error {
 	return nil
 }
 
+// RegisterFFITableProvider registers a foreign datafusion-ffi FFI_TableProvider
+// (produced by another library) under name. provider must point to a valid
+// FFI_TableProvider; the callee clones it, so the caller retains ownership of
+// the pointer. providerDataFusionVersion is the datafusion version the producing
+// library reports, checked against the native library's version before the
+// provider is dereferenced. The producing library must stay loaded for as long
+// as the table is registered, since the registered table calls back into it on
+// every scan. See datafusion.RegisterFFITableProvider for the full contract.
+func (conn *Connection) RegisterFFITableProvider(name string, provider unsafe.Pointer, providerDataFusionVersion string) error {
+	if conn == nil || conn.ptr == nil {
+		return errors.New("datafusion-go connection is closed")
+	}
+	if provider == nil {
+		return errors.New("datafusion-go FFI table provider is nil")
+	}
+
+	cname := C.CString(name)
+	defer C.free(unsafe.Pointer(cname))
+	cversion := C.CString(providerDataFusionVersion)
+	defer C.free(unsafe.Pointer(cversion))
+
+	var cerr *C.dfgo_error
+	if C.dfgo_connection_register_ffi_table_provider(conn.ptr, cname, provider, cversion, &cerr) != stateOK {
+		return takeError(cerr)
+	}
+	return nil
+}
+
+// DeregisterTable removes a table previously registered on the connection's
+// session. Removing a name that is not registered is not an error.
+func (conn *Connection) DeregisterTable(name string) error {
+	if conn == nil || conn.ptr == nil {
+		return errors.New("datafusion-go connection is closed")
+	}
+
+	cname := C.CString(name)
+	defer C.free(unsafe.Pointer(cname))
+
+	var cerr *C.dfgo_error
+	if C.dfgo_connection_deregister_table(conn.ptr, cname, &cerr) != stateOK {
+		return takeError(cerr)
+	}
+	return nil
+}
+
 func (conn *Connection) RegisterArrowReaderZeroCopy(name string, reader array.RecordReader) error {
 	if conn == nil || conn.ptr == nil {
 		return errors.New("datafusion-go connection is closed")

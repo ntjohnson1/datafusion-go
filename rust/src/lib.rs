@@ -13,7 +13,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::collections::{BTreeSet, HashMap};
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::fmt;
 use std::io::Cursor;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -28,11 +28,13 @@ use arrow::error::ArrowError;
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
+use datafusion::catalog::TableProvider;
 use datafusion::common::{DataFusionError, ParamValues, ScalarValue};
 use datafusion::datasource::MemTable;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::context::SessionConfig;
 use datafusion::prelude::SessionContext;
+use datafusion_ffi::table_provider::FFI_TableProvider;
 use datafusion_sql::parser::{DFParser, Statement as DFStatement};
 use datafusion_sql::sqlparser::ast::Statement as SQLStatement;
 use datafusion_sql::sqlparser::dialect::GenericDialect;
@@ -281,6 +283,21 @@ impl fmt::Display for CancelledError {
 
 impl std::error::Error for CancelledError {}
 
+// Raised when polling the DataFusion stream panics — most plausibly inside a
+// foreign FFI table provider's execution. The panic is contained before it can
+// unwind across the Arrow C stream callback into Go, and reported as a terminal
+// stream error instead.
+#[derive(Debug)]
+struct ReaderPanicError;
+
+impl fmt::Display for ReaderPanicError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("panic while reading query results across datafusion-go native boundary")
+    }
+}
+
+impl std::error::Error for ReaderPanicError {}
+
 struct StreamingReader {
     // Hold Inner so the runtime and SessionContext stay alive for every C stream
     // callback. The Go side may close statements/connections while rows remain.
@@ -307,15 +324,32 @@ impl Iterator for StreamingReader {
 
         let cancel = self.cancel.clone();
         let stream = &mut self.stream;
+        let runtime = &self.inner.runtime;
         // Arrow's C stream API is pull-based and synchronous. DataFusion's
         // stream is async, so each pull blocks this crate's runtime until either
         // the next batch arrives or cancellation wins the select.
-        let next = self.inner.runtime.block_on(async {
-            tokio::select! {
-                _ = cancel.cancelled() => Some(Err(cancelled_datafusion_error())),
-                item = stream.next() => item,
+        //
+        // Polling runs the table provider's execution, which for a foreign FFI
+        // provider is arbitrary producer code. A panic there must not unwind
+        // across the Arrow C stream callback into Go (undefined behavior), so it
+        // is contained here and reported as a terminal error, mirroring the
+        // `run_ffi` guard on the synchronous entry points.
+        let polled = catch_unwind(AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                tokio::select! {
+                    _ = cancel.cancelled() => Some(Err(cancelled_datafusion_error())),
+                    item = stream.next() => item,
+                }
+            })
+        }));
+
+        let next = match polled {
+            Ok(next) => next,
+            Err(_) => {
+                self.done = true;
+                return Some(Err(ArrowError::ExternalError(Box::new(ReaderPanicError))));
             }
-        });
+        };
 
         match next {
             Some(Ok(batch)) => Some(Ok(batch)),
@@ -1167,6 +1201,15 @@ pub extern "C" fn dfgo_datafusion_version() -> *const c_char {
     DATAFUSION_VERSION.as_ptr().cast()
 }
 
+/// The datafusion version this crate links, as a `&str`, for the FFI provider
+/// version handshake. Derived from the generated `DATAFUSION_VERSION` bytes.
+fn datafusion_version_str() -> &'static str {
+    CStr::from_bytes_with_nul(DATAFUSION_VERSION)
+        .expect("generated DATAFUSION_VERSION is NUL-terminated")
+        .to_str()
+        .expect("generated DATAFUSION_VERSION is valid UTF-8")
+}
+
 /// # Safety
 ///
 /// `dsn`, when non-null, must point to a valid NUL-terminated C string for the
@@ -1375,6 +1418,117 @@ pub unsafe extern "C" fn dfgo_connection_register_arrow_stream(
         // registration only.
         let conn = unsafe { &*conn };
         register_record_batches(&conn.inner, &name, schema, batches)
+    })
+}
+
+/// Register a foreign `datafusion-ffi` `FFI_TableProvider` produced by another
+/// library. `provider` points to an `FFI_TableProvider` (passed as an opaque
+/// `const void*` so the C header need not know datafusion-ffi's layout). The
+/// provider is imported via datafusion-ffi's `From<&FFI_TableProvider>`, which
+/// clones it — the caller retains ownership of `provider` and must free it.
+///
+/// The clone only bumps the foreign provider's refcount; the registered table
+/// invokes the provider's function pointers on every scan. The producing
+/// library therefore must stay loaded and un-freed for as long as the table
+/// remains registered on `conn` — its `scan`/`clone`/`release` function
+/// pointers dangle if it is unloaded, which is undefined behavior. The session
+/// backing the provider's (weakly held) task context should also outlive the
+/// registration; if it does not, queries against the table fail with a clean
+/// "TaskContextProvider went out of scope" error rather than crashing.
+///
+/// `provider_datafusion_version` is the datafusion version the producing
+/// library reports building against. It is compared against this crate's
+/// version *before* `provider` is dereferenced: `FFI_TableProvider` is a plain
+/// `repr(C)` vtable with no stable prefix, so its layout (and its own `version`
+/// function pointer) can only be trusted once the versions are known to match.
+/// A mismatch is rejected as an error instead of risking undefined behavior.
+/// This is a cooperative check and cannot detect a mislabeled provider.
+///
+/// # Safety
+///
+/// `conn` must be a live connection handle. `name` and
+/// `provider_datafusion_version` must be valid NUL-terminated C strings.
+/// `provider` must be a non-null pointer to a valid `FFI_TableProvider` built
+/// against the reported datafusion version. `err`, when non-null, must point to
+/// writable error-handle storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dfgo_connection_register_ffi_table_provider(
+    conn: *mut dfgo_connection,
+    name: *const c_char,
+    provider: *const c_void,
+    provider_datafusion_version: *const c_char,
+    err: *mut *mut dfgo_error,
+) -> i32 {
+    run_ffi(err, || {
+        if conn.is_null() {
+            return Err(FfiError::invalid_argument("connection handle is null"));
+        }
+        if provider.is_null() {
+            return Err(FfiError::invalid_argument("provider handle is null"));
+        }
+        let name = cstr_to_string(name, "table name")?;
+        if name.trim().is_empty() {
+            return Err(FfiError::invalid_argument("table name is empty"));
+        }
+        let provider_version =
+            cstr_to_string(provider_datafusion_version, "provider datafusion version")?;
+
+        // Out-of-band version handshake, checked BEFORE the provider is
+        // dereferenced. Because `FFI_TableProvider` has no stable prefix, reading
+        // anything out of it — including its own `version` fn-pointer — is only
+        // sound once we know the layouts match. A mismatch becomes a clean error
+        // instead of undefined behavior.
+        //
+        // This requires an exact datafusion version match, which is deliberately
+        // stricter than datafusion-ffi's own contract (it promises ABI stability
+        // at the major version only; see `datafusion_ffi::version`). datafusion
+        // is pre-1.0 and has broken layouts across minor/patch releases, so we
+        // refuse anything but an exact match rather than trust a looser bound.
+        let expected = datafusion_version_str();
+        if provider_version != expected {
+            return Err(FfiError::invalid_argument(format!(
+                "incompatible FFI table provider: datafusion-go links datafusion {expected}, but the provider reports {provider_version}; both sides must link the same datafusion version"
+            )));
+        }
+
+        // SAFETY: `conn` is non-null and borrowed only for the duration of
+        // registration.
+        let conn = unsafe { &*conn };
+        // SAFETY: `provider` is non-null, the version handshake above confirmed a
+        // matching datafusion build, and per the contract it points to a valid
+        // `FFI_TableProvider`. We only borrow it; `From` clones it.
+        let ffi_provider = unsafe { &*(provider as *const FFI_TableProvider) };
+        let table: Arc<dyn TableProvider> = ffi_provider.into();
+        conn.inner.ctx.register_table(&name, table)?;
+        Ok(())
+    })
+}
+
+/// Deregister a table previously registered on `conn` (for example one added by
+/// [`dfgo_connection_register_ffi_table_provider`]). Deregistering a name that
+/// is not currently registered is not an error.
+///
+/// # Safety
+///
+/// `conn` must be a live connection handle. `name` must be a valid
+/// NUL-terminated C string. `err`, when non-null, must point to writable
+/// error-handle storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dfgo_connection_deregister_table(
+    conn: *mut dfgo_connection,
+    name: *const c_char,
+    err: *mut *mut dfgo_error,
+) -> i32 {
+    run_ffi(err, || {
+        if conn.is_null() {
+            return Err(FfiError::invalid_argument("connection handle is null"));
+        }
+        let name = cstr_to_string(name, "table name")?;
+        // SAFETY: `conn` is non-null and borrowed only for the duration of the
+        // deregistration.
+        let conn = unsafe { &*conn };
+        conn.inner.ctx.deregister_table(&name)?;
+        Ok(())
     })
 }
 
@@ -1722,6 +1876,187 @@ pub unsafe extern "C" fn dfgo_error_free(err: *mut dfgo_error) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Registering a foreign `FFI_TableProvider` makes it queryable by name.
+    #[test]
+    fn registers_and_queries_ffi_table_provider() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use datafusion::execution::TaskContextProvider;
+        use datafusion_ffi::execution::FFI_TaskContextProvider;
+        use datafusion_ffi::table_provider::FFI_TableProvider;
+
+        // A one-column, three-row MemTable exported as an FFI_TableProvider.
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "a",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
+        )
+        .expect("record batch");
+        let mem: Arc<dyn TableProvider> =
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("memtable"));
+
+        // FFI_TaskContextProvider holds a Weak, so this SessionContext must
+        // outlive the exported provider for the duration of the test.
+        let tcp_ctx = Arc::new(SessionContext::new());
+        let tcp = Arc::clone(&tcp_ctx) as Arc<dyn TaskContextProvider>;
+        let ffi =
+            FFI_TableProvider::new(mem, true, None, FFI_TaskContextProvider::from(&tcp), None);
+
+        // A minimal connection handle to register into.
+        let runtime = Arc::new(Runtime::new().expect("runtime"));
+        let mut conn = dfgo_connection {
+            inner: Arc::new(Inner {
+                runtime: Arc::clone(&runtime),
+                ctx: SessionContext::new(),
+            }),
+        };
+
+        // Exercise the exported C entry point exactly as Go calls it.
+        let name = CString::new("t").unwrap();
+        let version = CString::new(datafusion_version_str()).unwrap();
+        let mut err: *mut dfgo_error = ptr::null_mut();
+        let rc = unsafe {
+            dfgo_connection_register_ffi_table_provider(
+                &mut conn,
+                name.as_ptr(),
+                &ffi as *const FFI_TableProvider as *const std::ffi::c_void,
+                version.as_ptr(),
+                &mut err,
+            )
+        };
+        assert_eq!(rc, DFG_OK, "register returned an error");
+        assert!(err.is_null(), "register set an error");
+
+        // The registered provider is queryable, and a predicate filters rows.
+        let rows: usize = runtime
+            .block_on(async {
+                conn.inner
+                    .ctx
+                    .sql("SELECT a FROM t WHERE a > 1 ORDER BY a")
+                    .await?
+                    .collect()
+                    .await
+            })
+            .expect("query")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 2, "expected rows a=2,3");
+
+        // Deregistering removes the table, so planning against it now fails.
+        let mut derr: *mut dfgo_error = ptr::null_mut();
+        let drc = unsafe { dfgo_connection_deregister_table(&mut conn, name.as_ptr(), &mut derr) };
+        assert_eq!(drc, DFG_OK, "deregister returned an error");
+        assert!(derr.is_null(), "deregister set an error");
+        let after = runtime.block_on(async { conn.inner.ctx.sql("SELECT a FROM t").await });
+        assert!(after.is_err(), "table should be gone after deregister");
+    }
+
+    /// A datafusion version mismatch is rejected before the provider pointer is
+    /// dereferenced, so a bogus pointer never gets read as a vtable.
+    #[test]
+    fn rejects_version_mismatch_before_dereference() {
+        let mut conn = dfgo_connection {
+            inner: Arc::new(Inner {
+                runtime: Arc::new(Runtime::new().expect("runtime")),
+                ctx: SessionContext::new(),
+            }),
+        };
+        let name = CString::new("t").unwrap();
+        let version = CString::new("0.0.0-not-a-real-version").unwrap();
+        // Not a real FFI_TableProvider; must never be dereferenced.
+        let bogus: [u8; 64] = [0; 64];
+        let mut err: *mut dfgo_error = ptr::null_mut();
+        let rc = unsafe {
+            dfgo_connection_register_ffi_table_provider(
+                &mut conn,
+                name.as_ptr(),
+                bogus.as_ptr() as *const std::ffi::c_void,
+                version.as_ptr(),
+                &mut err,
+            )
+        };
+        assert_eq!(rc, DFG_ERR);
+        assert!(!err.is_null());
+        unsafe { dfgo_error_free(err) };
+    }
+
+    /// A null provider pointer is rejected rather than dereferenced.
+    #[test]
+    fn rejects_null_ffi_table_provider() {
+        let mut conn = dfgo_connection {
+            inner: Arc::new(Inner {
+                runtime: Arc::new(Runtime::new().expect("runtime")),
+                ctx: SessionContext::new(),
+            }),
+        };
+        let name = CString::new("t").unwrap();
+        let version = CString::new(datafusion_version_str()).unwrap();
+        let mut err: *mut dfgo_error = ptr::null_mut();
+        let rc = unsafe {
+            dfgo_connection_register_ffi_table_provider(
+                &mut conn,
+                name.as_ptr(),
+                ptr::null(),
+                version.as_ptr(),
+                &mut err,
+            )
+        };
+        assert_eq!(rc, DFG_ERR);
+        assert!(!err.is_null());
+        unsafe { dfgo_error_free(err) };
+    }
+
+    /// A panic while polling the result stream — the path a foreign FFI table
+    /// provider's execution runs on — is contained and surfaced as a terminal
+    /// error, rather than unwinding across the Arrow C stream callback into Go.
+    #[test]
+    fn panic_while_polling_stream_is_contained() {
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::stream;
+
+        fn panicking_batch() -> Result<RecordBatch, DataFusionError> {
+            panic!("boom from a foreign table provider scan");
+        }
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "a",
+            DataType::Int64,
+            false,
+        )]));
+        // The panic fires when the stream is first polled, inside next().
+        let panicking = stream::once(async { panicking_batch() });
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            panicking,
+        ));
+
+        let mut reader = StreamingReader {
+            inner: Arc::new(Inner {
+                runtime: Arc::new(Runtime::new().expect("runtime")),
+                ctx: SessionContext::new(),
+            }),
+            schema,
+            stream,
+            cancel: Arc::new(CancelToken::new()),
+            done: false,
+        };
+
+        match reader.next() {
+            Some(Err(ArrowError::ExternalError(err))) => {
+                assert!(err.downcast_ref::<ReaderPanicError>().is_some());
+            }
+            other => panic!("expected a contained panic error, got {other:?}"),
+        }
+        // The reader is terminal after a contained panic and never re-polls.
+        assert!(reader.next().is_none());
+    }
 
     #[test]
     fn rewrites_question_marks_with_unicode_comments_and_multiline_sql() {
