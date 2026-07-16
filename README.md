@@ -399,9 +399,9 @@ rows, err := db.QueryContext(ctx, `SELECT ... FROM t WHERE ...`)
 A few contract points, all enforced or documented on `RegisterFFITableProvider`:
 
 - **Version handshake.** `providerVersion` must equal this package's `DataFusionVersion`; obtain it from the producing library, not from `DataFusionVersion`. The check runs before the provider pointer is dereferenced, so a mismatch is a clean error rather than a crash. The match is required to be exact — deliberately stricter than datafusion-ffi's major-version ABI contract, because datafusion is pre-1.0 and has broken layouts across minor releases.
-- **Ownership.** Registration clones the provider (bumping its refcount), so you retain ownership of the original pointer and may free it through its producing library once the call returns.
+- **Ownership.** The provider pointer must be memory owned by the producing foreign library (C/Rust), not Go heap memory, since native code retains callback pointers cloned out of it past the call. Registration clones the provider (bumping its refcount), so you retain ownership of the original pointer and may free it through its producing library once the call returns.
 - **Library lifetime.** The producing library must stay loaded for as long as the table is registered — the registered table calls back into its function pointers on every scan.
-- **Deregistration is explicit.** `RegisterFFITableProvider` returns a `*RegisteredTable` handle; call `Deregister` to remove the table before the producing library tears down. Closing the `*sql.Conn` also releases it. Dropping the handle does not.
+- **Deregistration is explicit.** `RegisterFFITableProvider` returns a `*RegisteredTable` handle; call `Deregister` to remove the table before the producing library tears down. The table's lifetime follows the session it was registered on: with an isolated session (`WithSharedSession(false)`) closing the `*sql.Conn` also releases it, but with a shared session (the default) it lives on the shared `SessionContext` and persists until `Deregister` or the owning `Connector` is closed. Dropping the handle never deregisters it.
 
 ### API Overview
 

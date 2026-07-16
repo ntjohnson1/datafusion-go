@@ -10,13 +10,19 @@ import (
 
 // RegisteredTable is a handle to a table registered on a connection by
 // RegisterFFITableProvider. Call Deregister to remove the table before the
-// producing library tears down; closing the underlying *sql.Conn also releases
-// it. The handle is safe for concurrent use.
+// producing library tears down. The handle is safe for concurrent use.
 //
-// Dropping the handle does not deregister the table: the table's lifetime is
-// owned by the connection, not by this handle, and a caller may legitimately
-// keep querying the table after dropping the handle. Deregistration is
-// therefore always explicit.
+// The table's lifetime follows the session it was registered on, not this
+// handle. With an isolated session (WithSharedSession(false)) the table lives
+// only as long as sqlConn, so closing that *sql.Conn also releases it. With a
+// shared session (the default) it is registered on the connector's shared
+// SessionContext and outlives sqlConn: it persists until Deregister is called
+// or the owning Connector is closed, and closing sqlConn alone does not release
+// it.
+//
+// Dropping the handle never deregisters the table: a caller may legitimately
+// keep querying it after dropping the handle. Deregistration is therefore
+// always explicit.
 type RegisteredTable struct {
 	sqlConn *sql.Conn
 	name    string
@@ -35,7 +41,12 @@ type RegisteredTable struct {
 // semantics: with WithSharedSession it is registered on the shared session and
 // is therefore visible to every connection sharing it, not just sqlConn.
 //
-// provider must point to a valid, initialized datafusion-ffi FFI_TableProvider.
+// provider must point to a valid, initialized datafusion-ffi FFI_TableProvider
+// that is owned by the producing foreign library — memory allocated by that
+// library (C/Rust), not Go heap memory. Registration clones callback pointers
+// out of the provider and native code invokes them long after this call
+// returns, so passing a Go-allocated pointer would violate cgo's pointer-passing
+// rules and risk corruption once Go's garbage collector moves or frees it.
 // providerDataFusionVersion is the datafusion version the library that produced
 // provider was built against; obtain it from that library (not from
 // DataFusionVersion). Registration fails with an error if it does not equal this
@@ -48,9 +59,9 @@ type RegisteredTable struct {
 // the caller still owns the original FFI_TableProvider pointer and may free it
 // through its producing library once this call returns. The producing library
 // itself, however, must stay loaded for as long as the table remains registered
-// (until Deregister or until sqlConn is closed): the registered table calls back
-// into the provider's function pointers on every scan, and unloading the library
-// leaves them dangling. The DataFusion session backing the provider should also
+// (see RegisteredTable for exactly when that ends): the registered table calls
+// back into the provider's function pointers on every scan, and unloading the
+// library leaves them dangling. The DataFusion session backing the provider should also
 // outlive the registration; if it does not, queries against the table fail with
 // a clean error rather than crashing.
 func RegisterFFITableProvider(ctx context.Context, sqlConn *sql.Conn, tableName string, provider unsafe.Pointer, providerDataFusionVersion string) (*RegisteredTable, error) {
@@ -93,10 +104,14 @@ func (t *RegisteredTable) Name() string {
 // no-op that returns nil, and deregistering a name that is no longer registered
 // is not an error.
 //
-// Closing the underlying *sql.Conn already releases the table, so an explicit
-// Deregister is only needed to remove it sooner. Like the other connection
-// operations in this package, Deregister on a closed connection propagates the
-// error database/sql reports (sql.ErrConnDone) rather than masking it.
+// With an isolated session, closing the underlying *sql.Conn already releases
+// the table, so an explicit Deregister is only needed to remove it sooner. With
+// a shared session (the default) the table lives on the shared SessionContext,
+// so closing sqlConn does not release it: Deregister (or closing the owning
+// Connector) is required. Deregister runs on sqlConn, so it must still be open;
+// like the other connection operations in this package, Deregister on a closed
+// connection propagates the error database/sql reports (sql.ErrConnDone) rather
+// than masking it.
 func (t *RegisteredTable) Deregister(ctx context.Context) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
