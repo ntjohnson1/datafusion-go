@@ -1487,9 +1487,7 @@ pub unsafe extern "C" fn dfgo_connection_register_ffi_table_provider(
         let expected = datafusion_version_str();
         if provider_version != expected {
             return Err(FfiError::invalid_argument(format!(
-                "incompatible FFI table provider: datafusion-go links datafusion \
-                 {expected}, but the provider reports {provider_version}; both sides \
-                 must link the same datafusion version"
+                "incompatible FFI table provider: datafusion-go links datafusion {expected}, but the provider reports {provider_version}; both sides must link the same datafusion version"
             )));
         }
 
